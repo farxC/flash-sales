@@ -4,37 +4,148 @@ A study project for exploring **concurrent systems at scale and async
 execution contexts**, using a limited-stock flash sale as the running
 scenario: many concurrent buyers racing against a fixed inventory.
 
-- **Backend**: Go, standard library only (`net/http`) — no framework,
-  so the concurrency primitives (goroutines, channels, `sync`,
-  atomics) stay front and center.
-- **Frontend**: Next.js (App Router, TypeScript, Tailwind) — mainly a
-  client for visualizing backend behavior (live stock counts, a buy
-  button under load), not the focus of study.
+- **Backend**: Go, standard library `net/http` for the API, plus
+  [`segmentio/kafka-go`](https://github.com/segmentio/kafka-go) for
+  the async checkout pipeline described below.
+- **Frontend**: Next.js (App Router, TypeScript, Tailwind) — a client
+  for visualizing backend behavior: a product list, a buy button, and
+  live order-status updates pushed over Server-Sent Events.
+- **Messaging**: Kafka (KRaft mode, single broker) backs the async
+  handoff between the pieces described below.
+
+## Architecture
+
+### Product catalog
+
+`GET /products` is served by a small DDD-style `Product` aggregate
+(`backend/internal/product`) — a constructor that enforces invariants
+(non-empty name, non-negative price/stock), and a repository
+abstraction currently backed by a single in-memory, hardcoded product.
+
+### Checkout flow (fire-and-forget, Kafka-backed)
+
+`POST /checkout` (body: `{productId, quantity}`) doesn't wait for a
+reservation to be decided — it validates synchronously, then hands
+off to an async pipeline of three workers:
+
+```
+POST /checkout
+  │  validate: 400 if quantity <= 0, 404 if productId unknown
+  │  generate a request id, enqueue, return 202 + {requestId} immediately
+  ▼
+requests channel (bounded; 503 if full instead of blocking)
+  ▼
+Worker A -- StockWorker
+  the ONLY goroutine allowed to mutate Product.stock -- serializing
+  every request through one writer is what makes the invariant safe
+  with no lock on Product itself.
+  - decrements stock, or marks the request rejected (out of stock)
+  - publishes a ReservationEvent -> Kafka topic "checkout.reservations"
+  ▼
+Worker B -- EventConsumer  (Kafka consumer group, manual offset commit)
+  - waits ~3s (fake latency, simulating e.g. payment confirmation)
+  - reserved requests get a random outcome: 80% approved, 20% rejected
+  - on rejection, sends a ReleaseRequest back to Worker A, which adds
+    the stock back (a compensating action -- nothing is permanently
+    lost to a rejected order)
+  - publishes an OrderStatusEvent -> Kafka topic "order.status"
+  ▼
+Worker C -- OrderStatusBroadcaster  (Kafka consumer group)
+  - fans every order.status event out, over Server-Sent Events, to
+    every currently-connected browser (GET /events)
+  ▼
+Frontend (EventSource) -- matches incoming events against the
+  request id it's waiting on, and updates that product's buy button
+  from "Awaiting confirmation..." to an approved/rejected result.
+```
+
+A few things this design deliberately demonstrates:
+- **Single-writer instead of locking** — Worker A needs no mutex on
+  `Product` because it's the only goroutine that ever touches it.
+- **Backpressure at the edge** — the intake channel is bounded; once
+  full, new requests get an immediate `503` instead of piling up.
+- **At-least-once delivery** — Worker B and Worker C commit their
+  Kafka offsets only *after* processing, so a crash mid-processing
+  redelivers the message rather than silently dropping it.
+- **A visible bottleneck** — Worker B's fake 3s latency caps order
+  confirmation throughput to roughly one every 3 seconds, so a burst
+  of checkouts visibly queues up in `order.status` even though stock
+  reservations (Worker A) happen almost instantly.
+- **Broadcast/fan-out** — Worker C's SSE stream is a different async
+  pattern than A/B's queue-consumption: every connected client gets
+  every event, rather than each message going to exactly one
+  consumer.
+
+### Endpoints
+
+| Endpoint | Method | Notes |
+|---|---|---|
+| `/health` | GET | liveness check |
+| `/products` | GET | list of products (currently one, hardcoded) |
+| `/checkout` | POST | `{productId, quantity}` → `202 {requestId}`, or `400`/`404`/`503` |
+| `/events` | GET | Server-Sent Events stream of `OrderStatusEvent`s |
 
 ## Running locally
 
+Kafka needs its topics created once before the backend can publish
+to them (auto-creation is intentionally off, so partition counts are
+explicit):
+
+```sh
+docker compose up -d kafka
+
+docker exec flash-sales-kafka-1 /opt/kafka/bin/kafka-topics.sh \
+  --create --topic checkout.reservations \
+  --partitions 1 --replication-factor 1 --bootstrap-server localhost:9092
+
+docker exec flash-sales-kafka-1 /opt/kafka/bin/kafka-topics.sh \
+  --create --topic order.status \
+  --partitions 1 --replication-factor 1 --bootstrap-server localhost:9092
 ```
+
+Then bring up the rest of the stack:
+
+```sh
 docker compose up --build
 ```
 
 - Backend: http://localhost:8081 (health check at `/health`)
 - Frontend: http://localhost:3000
+- Kafka broker: `localhost:9092` (for `kafka-topics.sh` from the host)
 
-Both services bind-mount their source directories and hot-reload on
-change (the Go backend via [Air](https://github.com/air-verse/air),
+Kafka's data is stored in a named volume (`kafka_data`), so topics
+survive a `docker compose down` — only creating them is a one-time
+step, not something needed on every restart.
+
+All three services bind-mount their source directories and hot-reload
+on change (the Go backend via [Air](https://github.com/air-verse/air),
 the frontend via `next dev`).
 
 ## Roadmap
 
-This repo starts as a bare skeleton with no flash-sale logic yet.
-Each concurrency topic below is added as its own pass, in roughly
-this order:
+Original plan vs. what actually got built, and what's still ahead:
 
-1. **In-memory stock contention** — mutexes, atomics
-2. **Worker pools and rate limiting** on the purchase endpoint
-3. **Context cancellation and timeouts** under load
-4. **DB-backed contention** — transactions, row locks (introduces Postgres)
-5. **Distributed locking / caching** (introduces Redis)
-6. **Queueing / a virtual waiting room** for traffic spikes
+1. ~~In-memory stock contention — mutexes, atomics~~ → built instead
+   as a **single-writer goroutine** (Worker A) serializing access via
+   channels, the CSP alternative to locking.
+2. ~~Worker pools and rate limiting~~ → partially covered: the intake
+   channel's bounded-size + reject-when-full is a basic backpressure
+   mechanism. A true worker *pool* (multiple concurrent writers) isn't
+   applicable here since stock mutation is deliberately single-writer.
+3. **Messaging & async delivery (Kafka)** — not on the original list,
+   but became the actual focus: producer/consumer semantics, consumer
+   groups, at-least-once delivery with manual commits, a compensating
+   "release" action, and a broadcast/fan-out pattern via SSE. Done.
+4. **Context cancellation and timeouts under load** — partially in
+   place (workers shut down cleanly via `context`, the fake
+   confirmation delay is cancellation-aware); deeper timeout/backoff
+   behavior under sustained load is still open.
+5. **DB-backed contention** — transactions, row locks (introduces
+   Postgres). Not started.
+6. **Distributed locking / caching** (introduces Redis). Not started.
+7. **A real queueing / waiting-room UI** for traffic spikes — Worker
+   B's fake latency already produces a visible backlog; an actual
+   waiting-room experience on the frontend is still open.
 
-See `docs/superpowers/specs/` for the design spec behind each pass.
+See `docs/superpowers/specs/` for the design spec behind the initial
+pass.
