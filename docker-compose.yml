@@ -1,4 +1,16 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: flashsales
+      POSTGRES_PASSWORD: flashsales
+      POSTGRES_DB: flashsales
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+
   kafka:
     image: apache/kafka:3.8.0
     ports:
@@ -27,8 +39,10 @@ services:
       - "8081:8080"
     environment:
       - KAFKA_BROKER=kafka:9092
+      - POSTGRES_DSN=postgres://flashsales:flashsales@postgres:5432/flashsales?sslmode=disable
     depends_on:
       - kafka
+      - postgres
 
   frontend:
     build:
@@ -47,3 +61,4 @@ services:
 
 volumes:
   kafka_data:
+  postgres_data:
