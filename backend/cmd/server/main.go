@@ -1,11 +1,19 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
+	"os"
 
+	"flash-sales/backend/internal/checkout"
 	"flash-sales/backend/internal/product"
 )
+
+// checkoutQueueSize bounds how many checkout requests can be waiting
+// for the stock worker at once. Once full, the handler rejects new
+// requests with 503 instead of blocking -- see the /checkout design.
+const checkoutQueueSize = 256
 
 func main() {
 	seedProduct, err := product.NewProduct(
@@ -21,12 +29,44 @@ func main() {
 	productRepo := product.NewInMemoryRepository([]*product.Product{seedProduct})
 	productHandler := product.NewHandler(productRepo)
 
+	kafkaBroker := os.Getenv("KAFKA_BROKER")
+	if kafkaBroker == "" {
+		kafkaBroker = "localhost:9092"
+	}
+
+	reservationPublisher := checkout.NewEventPublisher(kafkaBroker, checkout.ReservationsTopic)
+	defer reservationPublisher.Close()
+
+	orderPublisher := checkout.NewEventPublisher(kafkaBroker, checkout.OrderStatusTopic)
+	defer orderPublisher.Close()
+
+	requests := make(chan checkout.Request, checkoutQueueSize)
+	releases := make(chan checkout.ReleaseRequest, checkoutQueueSize)
+
+	consumer := checkout.NewEventConsumer(kafkaBroker, orderPublisher, releases)
+	defer consumer.Close()
+
+	broadcaster := checkout.NewOrderStatusBroadcaster(kafkaBroker)
+	defer broadcaster.Close()
+
+	stockWorker := checkout.NewStockWorker(productRepo, requests, releases, reservationPublisher)
+	checkoutHandler := checkout.NewHandler(productRepo, requests)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go stockWorker.Run(ctx)
+	go consumer.Run(ctx)
+	go broadcaster.Run(ctx)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 	mux.HandleFunc("GET /products", productHandler.List)
+	mux.HandleFunc("POST /checkout", checkoutHandler.Checkout)
+	mux.HandleFunc("GET /events", broadcaster.ServeSSE)
 
 	addr := ":8080"
 	log.Printf("listening on %s", addr)
