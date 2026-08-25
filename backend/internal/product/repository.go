@@ -1,8 +1,13 @@
 package product
 
+import "errors"
+
+var ErrProductNotFound = errors.New("product: not found")
+
 // Repository provides read access to the product catalog.
 type Repository interface {
 	List() ([]*Product, error)
+	FindByID(id string) (*Product, error)
 }
 
 // InMemoryRepository is a Repository backed by a fixed in-memory
@@ -18,4 +23,13 @@ func NewInMemoryRepository(products []*Product) *InMemoryRepository {
 
 func (r *InMemoryRepository) List() ([]*Product, error) {
 	return r.products, nil
+}
+
+func (r *InMemoryRepository) FindByID(id string) (*Product, error) {
+	for _, p := range r.products {
+		if p.ID() == id {
+			return p, nil
+		}
+	}
+	return nil, ErrProductNotFound
 }
