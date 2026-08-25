@@ -140,10 +140,36 @@ Original plan vs. what actually got built, and what's still ahead:
    place (workers shut down cleanly via `context`, the fake
    confirmation delay is cancellation-aware); deeper timeout/backoff
    behavior under sustained load is still open.
-5. **DB-backed contention** — transactions, row locks (introduces
-   Postgres). Not started.
-6. **Distributed locking / caching** (introduces Redis). Not started.
-7. **A real queueing / waiting-room UI** for traffic spikes — Worker
+5. **Persist orders and the product catalog (Postgres)** — the most
+   urgent gap: Kafka guarantees the *events* survive a crash, but the
+   *current state* (remaining stock, what got bought) doesn't --
+   proven directly by killing the backend mid-request and watching
+   stock reset to 100. This also sets up a direct, side-by-side
+   comparison of three different answers to the same concurrency
+   problem: the in-process single-writer goroutine (already built),
+   a Postgres transaction/row lock (this step), and a Redis
+   distributed lock (next step). Not started.
+6. **Coordinate stock across multiple backend instances (Redis)** —
+   depends on step 5. Worker A is safe today only because there is
+   exactly **one** process running **one** goroutine that ever
+   touches `Product.stock`. That stops being true the moment you run
+   more than one backend replica (which a flash sale "at scale"
+   realistically would) -- each replica would have its own
+   uncoordinated `StockWorker`. Redis (an atomic `DECR`, or a
+   distributed lock) is what replaces the single-writer invariant
+   once "single process" is no longer the case. Not started.
+7. **Cache invalidation under concurrent writes (Redis)** — a
+   deliberately different motivation than step 6: not "make reads
+   faster" but "what happens when a cached product's stock goes stale
+   the instant a write happens underneath it." Framed this way it
+   stays a concurrency lesson rather than a pure performance one. Not
+   started.
+8. **Read/write split (CQRS-style)** — well-motivated here (catalog
+   reads vastly outnumber checkout writes during a real flash sale),
+   but deliberately sequenced *after* step 5 so it doesn't mix two
+   new kinds of complexity (persistence, then replication/eventual
+   consistency) into the same pass. Not started.
+9. **A real queueing / waiting-room UI** for traffic spikes — Worker
    B's fake latency already produces a visible backlog; an actual
    waiting-room experience on the frontend is still open.
 
