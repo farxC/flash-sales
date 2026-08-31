@@ -22,7 +22,7 @@ type productResponse struct {
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	products, err := h.repo.List()
+	products, err := h.repo.List(r.Context())
 	if err != nil {
 		http.Error(w, "failed to list products", http.StatusInternalServerError)
 		return

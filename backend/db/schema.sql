@@ -70,3 +70,12 @@ CREATE INDEX order_items_product_id_idx ON order_items(product_id);
 CREATE TRIGGER order_items_set_updated_at
   BEFORE UPDATE ON order_items
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Seed data for local development.
+INSERT INTO products (name, description, value_in_cents, stock)
+VALUES (
+  'Limited Edition Sneakers',
+  'Only 100 pairs available in this flash sale.',
+  1999900,
+  100
+);

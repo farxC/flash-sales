@@ -39,7 +39,7 @@ func (h *Handler) Checkout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.repo.FindByID(body.ProductID); err != nil {
+	if _, err := h.repo.FindByID(r.Context(), body.ProductID); err != nil {
 		http.Error(w, "product not found", http.StatusNotFound)
 		return
 	}

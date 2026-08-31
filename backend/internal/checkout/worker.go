@@ -37,7 +37,7 @@ func (w *StockWorker) Run(ctx context.Context) {
 		case req := <-w.requests:
 			w.handleReservation(ctx, req)
 		case rel := <-w.releases:
-			w.handleRelease(rel)
+			w.handleRelease(ctx, rel)
 		}
 	}
 }
@@ -49,13 +49,23 @@ func (w *StockWorker) handleReservation(ctx context.Context, req Request) {
 		Quantity:  req.Quantity,
 	}
 
-	p, err := w.repo.FindByID(req.ProductID)
+	p, err := w.repo.FindByID(ctx, req.ProductID)
 	if err != nil {
 		evt.Status = StatusRejected
 		evt.Reason = "product not found"
 	} else if err := p.DecrementStock(req.Quantity); err != nil {
 		evt.Status = StatusRejected
 		evt.Reason = err.Error()
+	} else if err := w.repo.Save(ctx, p); err != nil {
+		// The in-memory decrement already happened; if the write to
+		// Postgres fails, Product.stock and the DB have now diverged.
+		// This fetch-mutate-save sequence stays safe under concurrency
+		// only because StockWorker is still the single writer -- see
+		// the pending discussion on moving the invariant into Postgres
+		// itself once there's more than one writer.
+		evt.Status = StatusRejected
+		evt.Reason = "failed to persist reservation"
+		log.Printf("checkout: failed to save product after decrement for request %s: %v", req.ID, err)
 	} else {
 		evt.Status = StatusReserved
 	}
@@ -70,13 +80,17 @@ func (w *StockWorker) handleReservation(ctx context.Context, req Request) {
 	}
 }
 
-func (w *StockWorker) handleRelease(rel ReleaseRequest) {
-	p, err := w.repo.FindByID(rel.ProductID)
+func (w *StockWorker) handleRelease(ctx context.Context, rel ReleaseRequest) {
+	p, err := w.repo.FindByID(ctx, rel.ProductID)
 	if err != nil {
 		log.Printf("checkout: failed to release stock for request %s: %v", rel.RequestID, err)
 		return
 	}
 	if err := p.ReleaseStock(rel.Quantity); err != nil {
 		log.Printf("checkout: failed to release stock for request %s: %v", rel.RequestID, err)
+		return
+	}
+	if err := w.repo.Save(ctx, p); err != nil {
+		log.Printf("checkout: failed to save product after release for request %s: %v", rel.RequestID, err)
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"flash-sales/backend/internal/checkout"
 	"flash-sales/backend/internal/product"
 )
@@ -16,17 +18,23 @@ import (
 const checkoutQueueSize = 256
 
 func main() {
-	seedProduct, err := product.NewProduct(
-		"prod-1",
-		"Limited Edition Sneakers",
-		"Only 100 pairs available in this flash sale.",
-		1999900,
-		100,
-	)
-	if err != nil {
-		log.Fatal(err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	postgresDSN := os.Getenv("POSTGRES_DSN")
+	if postgresDSN == "" {
+		postgresDSN = "postgres://flashsales:flashsales@localhost:5432/flashsales?sslmode=disable"
 	}
-	productRepo := product.NewInMemoryRepository([]*product.Product{seedProduct})
+	pgPool, err := pgxpool.New(ctx, postgresDSN)
+	if err != nil {
+		log.Fatalf("failed to create postgres pool: %v", err)
+	}
+	defer pgPool.Close()
+	if err := pgPool.Ping(ctx); err != nil {
+		log.Fatalf("failed to connect to postgres: %v", err)
+	}
+
+	productRepo := product.NewPostgresRepository(pgPool)
 	productHandler := product.NewHandler(productRepo)
 
 	kafkaBroker := os.Getenv("KAFKA_BROKER")
@@ -51,9 +59,6 @@ func main() {
 
 	stockWorker := checkout.NewStockWorker(productRepo, requests, releases, reservationPublisher)
 	checkoutHandler := checkout.NewHandler(productRepo, requests)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	go stockWorker.Run(ctx)
 	go consumer.Run(ctx)
