@@ -28,36 +28,26 @@ abstraction currently backed by a single in-memory, hardcoded product.
 reservation to be decided — it validates synchronously, then hands
 off to an async pipeline of three workers:
 
-```
-POST /checkout
-  │  validate: 400 if quantity <= 0, 404 if productId unknown
-  │  generate a request id, enqueue, return 202 + {requestId} immediately
-  ▼
-requests channel (bounded; 503 if full instead of blocking)
-  ▼
-Worker A -- StockWorker
-  the ONLY goroutine allowed to mutate Product.stock -- serializing
-  every request through one writer is what makes the invariant safe
-  with no lock on Product itself.
-  - decrements stock, or marks the request rejected (out of stock)
-  - publishes a ReservationEvent -> Kafka topic "checkout.reservations"
-  ▼
-Worker B -- EventConsumer  (Kafka consumer group, manual offset commit)
-  - waits ~3s (fake latency, simulating e.g. payment confirmation)
-  - reserved requests get a random outcome: 80% approved, 20% rejected
-  - on rejection, sends a ReleaseRequest back to Worker A, which adds
-    the stock back (a compensating action -- nothing is permanently
-    lost to a rejected order)
-  - publishes an OrderStatusEvent -> Kafka topic "order.status"
-  ▼
-Worker C -- OrderStatusBroadcaster  (Kafka consumer group)
-  - fans every order.status event out, over Server-Sent Events, to
-    every currently-connected browser (GET /events)
-  ▼
-Frontend (EventSource) -- matches incoming events against the
+![Checkout architecture: POST /checkout hands off to Worker A (StockWorker) via a buffered FIFO channel, which publishes to the checkout.reservations Kafka topic; Worker B (EventConsumer) consumes it, publishes to order.status, and can send a compensating release back to Worker A; Worker C (OrderStatusBroadcaster) consumes order.status and fans it out over SSE to every client connected to GET /events](docs/images/architecture.png)
+
+- **Worker A — StockWorker**: the ONLY goroutine allowed to mutate
+  `Product.stock` — serializing every request through one writer is
+  what makes the invariant safe with no lock on `Product` itself.
+  Decrements stock, or marks the request rejected (out of stock),
+  then publishes a `ReservationEvent` to `checkout.reservations`.
+- **Worker B — EventConsumer** (Kafka consumer group, manual offset
+  commit): waits ~3s (fake latency, simulating e.g. payment
+  confirmation). Reserved requests get a random outcome — 80%
+  approved, 20% rejected. On rejection, it sends a `ReleaseRequest`
+  back to Worker A, which adds the stock back (a compensating
+  action — nothing is permanently lost to a rejected order), then
+  publishes an `OrderStatusEvent` to `order.status`.
+- **Worker C — OrderStatusBroadcaster** (Kafka consumer group): fans
+  every `order.status` event out, over Server-Sent Events, to every
+  currently-connected browser (`GET /events`).
+- **Frontend (EventSource)**: matches incoming events against the
   request id it's waiting on, and updates that product's buy button
   from "Awaiting confirmation..." to an approved/rejected result.
-```
 
 A few things this design deliberately demonstrates:
 - **Single-writer instead of locking** — Worker A needs no mutex on
