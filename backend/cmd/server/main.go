@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -13,9 +14,22 @@ import (
 )
 
 // checkoutQueueSize bounds how many checkout requests can be waiting
-// for the stock worker at once. Once full, the handler rejects new
-// requests with 503 instead of blocking -- see the /checkout design.
+// for the stock worker pool at once. Once full, the handler rejects
+// new requests with 503 instead of blocking -- see the /checkout
+// design.
 const checkoutQueueSize = 256
+
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -60,7 +74,11 @@ func main() {
 	stockWorker := checkout.NewStockWorker(productRepo, requests, releases, reservationPublisher)
 	checkoutHandler := checkout.NewHandler(productRepo, requests)
 
-	go stockWorker.Run(ctx)
+	stockWorkerPoolSize := envInt("STOCK_WORKER_POOL_SIZE", 4)
+	log.Printf("starting %d stock workers", stockWorkerPoolSize)
+	for i := range stockWorkerPoolSize {
+		go stockWorker.Run(ctx, i)
+	}
 	go consumer.Run(ctx)
 	go broadcaster.Run(ctx)
 
