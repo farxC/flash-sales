@@ -7,16 +7,22 @@ import (
 
 var ErrProductNotFound = errors.New("product: not found")
 
-// Repository provides access to the product catalog.
+// Repository provides access to the product catalog. DecrementStock
+// and ReleaseStock are expected to be atomic -- safe to call from any
+// number of concurrent callers without an external lock.
 type Repository interface {
 	List(ctx context.Context) ([]*Product, error)
 	FindByID(ctx context.Context, id string) (*Product, error)
-	Save(ctx context.Context, p *Product) error
+	DecrementStock(ctx context.Context, id string, qty int) error
+	ReleaseStock(ctx context.Context, id string, qty int) error
 }
 
 // InMemoryRepository is a Repository backed by a fixed in-memory
 // slice, seeded once at construction. Useful as a lightweight test
-// double -- the running application uses PostgresRepository.
+// double -- the running application uses PostgresRepository, whose
+// atomic SQL statements are what actually enforce the invariant
+// under concurrency. This implementation is NOT safe for concurrent
+// callers.
 type InMemoryRepository struct {
 	products []*Product
 }
@@ -38,12 +44,18 @@ func (r *InMemoryRepository) FindByID(ctx context.Context, id string) (*Product,
 	return nil, ErrProductNotFound
 }
 
-func (r *InMemoryRepository) Save(ctx context.Context, p *Product) error {
-	for i, existing := range r.products {
-		if existing.ID() == p.ID() {
-			r.products[i] = p
-			return nil
-		}
+func (r *InMemoryRepository) DecrementStock(ctx context.Context, id string, qty int) error {
+	p, err := r.FindByID(ctx, id)
+	if err != nil {
+		return err
 	}
-	return ErrProductNotFound
+	return p.DecrementStock(qty)
+}
+
+func (r *InMemoryRepository) ReleaseStock(ctx context.Context, id string, qty int) error {
+	p, err := r.FindByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	return p.ReleaseStock(qty)
 }

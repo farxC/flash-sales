@@ -61,12 +61,42 @@ func (r *PostgresRepository) FindByID(ctx context.Context, id string) (*Product,
 	return p, nil
 }
 
-func (r *PostgresRepository) Save(ctx context.Context, p *Product) error {
+func (r *PostgresRepository) DecrementStock(ctx context.Context, id string, qty int) error {
+	// A plain UPDATE ... WHERE stock >= $1 can't tell "not enough
+	// stock" apart from "no such product" -- both leave RowsAffected
+	// at 0. This writable CTE resolves that in the same atomic
+	// statement: the UPDATE never deletes a row, so checking EXISTS
+	// against the table afterward reflects the product's existence
+	// independent of whether the conditional decrement fired.
+	var decremented int
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		WITH updated AS (
+			UPDATE products
+			SET stock = stock - $1
+			WHERE id = $2 AND stock >= $1
+			RETURNING id
+		)
+		SELECT
+			(SELECT COUNT(*) FROM updated),
+			EXISTS(SELECT 1 FROM products WHERE id = $2)
+	`, qty, id).Scan(&decremented, &exists)
+	if err != nil {
+		return err
+	}
+	if decremented > 0 {
+		return nil
+	}
+	if !exists {
+		return ErrProductNotFound
+	}
+	return ErrInsufficientStock
+}
+
+func (r *PostgresRepository) ReleaseStock(ctx context.Context, id string, qty int) error {
 	tag, err := r.pool.Exec(ctx, `
-		UPDATE products
-		SET name = $1, description = $2, value_in_cents = $3, stock = $4
-		WHERE id = $5
-	`, p.Name(), p.Description(), p.ValueInCents(), p.Stock(), p.ID())
+		UPDATE products SET stock = stock + $1 WHERE id = $2
+	`, qty, id)
 	if err != nil {
 		return err
 	}
