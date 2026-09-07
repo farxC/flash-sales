@@ -165,3 +165,10 @@ Original plan vs. what actually got built, and what's still ahead:
 
 See `docs/superpowers/specs/` for the design spec behind the initial
 pass.
+
+## Learning resources
+
+- [`docs/learning/go-scheduler.md`](docs/learning/go-scheduler.md) —
+  reading/watching list on the Go runtime scheduler (the GMP model,
+  work-stealing, how goroutines get picked to receive from a shared
+  channel), the background behind how the `StockWorker` pool behaves.
