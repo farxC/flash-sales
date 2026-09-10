@@ -19,8 +19,31 @@ scenario: many concurrent buyers racing against a fixed inventory.
 
 `GET /products` is served by a small DDD-style `Product` aggregate
 (`backend/internal/product`) — a constructor that enforces invariants
-(non-empty name, non-negative price/stock), and a repository
-abstraction currently backed by a single in-memory, hardcoded product.
+(non-empty name, non-negative price/stock) — backed by
+`PostgresRepository`, which also enforces the stock invariant itself
+via atomic `UPDATE` statements (see `DecrementStock`/`ReleaseStock`).
+An `InMemoryRepository` still exists as a lightweight test double.
+
+**A known limitation worth being explicit about:** `ReleaseStock` is
+bounded by an `initial_stock` column — fixed once at product
+creation, never updated afterward — so a release can never push
+`stock` above what the product started with (see
+`TestReleaseStock_ExceedsInitialStock`). This is **wrong for a real
+system**: a product is normally restocked repeatedly over its
+lifetime (new inventory arrives, quantities get adjusted), and
+`initial_stock` only ever reflects the *first-ever* stock-taking — it
+doesn't know about a legitimate restock, so it would eventually start
+rejecting perfectly valid releases as the real ceiling drifts upward
+while `initial_stock` stays frozen. The correct real-world fix is a
+*dynamic* bound instead of a static one: either a `reserved` counter
+(incremented by `DecrementStock`, decremented by `ReleaseStock`, so
+the check becomes "can't release more than is currently reserved" —
+survives any number of restocks), or the `orders`/`order_items`
+ledger already in `schema.sql` but not yet wired into the checkout
+flow, which would track the exact quantity tied to each specific
+reservation rather than a single product-wide number. `initial_stock`
+was a deliberate simplification for this pass, not a design worth
+carrying into anything beyond a study project.
 
 ### Checkout flow (fire-and-forget, Kafka-backed)
 

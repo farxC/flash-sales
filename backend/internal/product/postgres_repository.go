@@ -19,7 +19,7 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 
 func (r *PostgresRepository) List(ctx context.Context) ([]*Product, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id::text, name, description, value_in_cents, stock
+		SELECT id::text, name, description, value_in_cents, stock, initial_stock
 		FROM products
 		ORDER BY created_at
 	`)
@@ -45,7 +45,7 @@ func (r *PostgresRepository) List(ctx context.Context) ([]*Product, error) {
 
 func (r *PostgresRepository) FindByID(ctx context.Context, id string) (*Product, error) {
 	row := r.pool.QueryRow(ctx, `
-		SELECT id::text, name, description, value_in_cents, stock
+		SELECT id::text, name, description, value_in_cents, stock, initial_stock
 		FROM products
 		WHERE id = $1
 	`, id)
@@ -94,16 +94,33 @@ func (r *PostgresRepository) DecrementStock(ctx context.Context, id string, qty 
 }
 
 func (r *PostgresRepository) ReleaseStock(ctx context.Context, id string, qty int) error {
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE products SET stock = stock + $1 WHERE id = $2
-	`, qty, id)
+	// Same ambiguity as DecrementStock, same fix: a writable CTE lets
+	// one atomic statement distinguish "no such product" from "this
+	// release would exceed initial_stock" -- the UPDATE never deletes
+	// a row, so EXISTS afterward reflects existence either way.
+	var released int
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		WITH updated AS (
+			UPDATE products
+			SET stock = stock + $1
+			WHERE id = $2 AND stock + $1 <= initial_stock
+			RETURNING id
+		)
+		SELECT
+			(SELECT COUNT(*) FROM updated),
+			EXISTS(SELECT 1 FROM products WHERE id = $2)
+	`, qty, id).Scan(&released, &exists)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	if released > 0 {
+		return nil
+	}
+	if !exists {
 		return ErrProductNotFound
 	}
-	return nil
+	return ErrReleaseExceedsInitialStock
 }
 
 // rowScanner covers both pgx.Row (QueryRow) and pgx.Rows (Query),
@@ -116,11 +133,11 @@ func scanProduct(row rowScanner) (*Product, error) {
 	var (
 		id, name, description string
 		valueInCents          int64
-		stock                 int
+		stock, initialStock   int
 	)
-	if err := row.Scan(&id, &name, &description, &valueInCents, &stock); err != nil {
+	if err := row.Scan(&id, &name, &description, &valueInCents, &stock, &initialStock); err != nil {
 		return nil, err
 	}
 
-	return NewProduct(id, name, description, valueInCents, stock)
+	return RehydrateProduct(id, name, description, valueInCents, stock, initialStock)
 }

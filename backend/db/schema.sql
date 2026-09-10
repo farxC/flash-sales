@@ -29,6 +29,10 @@ CREATE TABLE products (
   description TEXT NOT NULL DEFAULT '',
   value_in_cents BIGINT NOT NULL CHECK (value_in_cents >= 0),
   stock INT NOT NULL CHECK (stock >= 0),
+  -- Fixed at creation, never changes afterward. ReleaseStock checks
+  -- against this so a release can never push stock past what the
+  -- product actually started with.
+  initial_stock INT NOT NULL CHECK (initial_stock >= 0),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -72,10 +76,11 @@ CREATE TRIGGER order_items_set_updated_at
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- Seed data for local development.
-INSERT INTO products (name, description, value_in_cents, stock)
+INSERT INTO products (name, description, value_in_cents, stock, initial_stock)
 VALUES (
   'Limited Edition Sneakers',
   'Only 100 pairs available in this flash sale.',
   1999900,
+  100,
   100
 );

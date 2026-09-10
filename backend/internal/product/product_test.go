@@ -110,3 +110,46 @@ func TestReleaseStock_Success(t *testing.T) {
 		t.Fatalf("stock = %d, want 5", p.Stock())
 	}
 }
+
+func TestReleaseStock_ExceedsInitialStock(t *testing.T) {
+	p, err := NewProduct("id-1", "Widget", "desc", 100, 10)
+	if err != nil {
+		t.Fatalf("unexpected error building product: %v", err)
+	}
+
+	if err := p.DecrementStock(3); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.Stock() != 7 {
+		t.Fatalf("stock = %d, want 7", p.Stock())
+	}
+
+	// 7 + 5 = 12, exceeding the initial stock of 10 -- more than was
+	// ever taken out is being put back.
+	if err := p.ReleaseStock(5); err != ErrReleaseExceedsInitialStock {
+		t.Fatalf("got err %v, want %v", err, ErrReleaseExceedsInitialStock)
+	}
+	if p.Stock() != 7 {
+		t.Fatalf("stock changed to %d, want unchanged 7", p.Stock())
+	}
+}
+
+func TestReleaseStock_UpToInitialStockSucceeds(t *testing.T) {
+	p, err := NewProduct("id-1", "Widget", "desc", 100, 10)
+	if err != nil {
+		t.Fatalf("unexpected error building product: %v", err)
+	}
+
+	if err := p.DecrementStock(3); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// 7 + 3 = 10, landing exactly on the initial stock -- the
+	// boundary itself must be allowed, only exceeding it is rejected.
+	if err := p.ReleaseStock(3); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.Stock() != 10 {
+		t.Fatalf("stock = %d, want 10", p.Stock())
+	}
+}

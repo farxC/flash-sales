@@ -122,9 +122,16 @@ func TestStockWorker_HandleReservation_ProductNotFound(t *testing.T) {
 }
 
 func TestStockWorker_HandleRelease_Success(t *testing.T) {
-	p, repo := newWorkerTestProduct(t, 3)
+	p, repo := newWorkerTestProduct(t, 5)
 	pub := &fakePublisher{}
 	w := NewStockWorker(repo, nil, nil, pub)
+
+	// Simulate a prior reservation of 2 units before releasing them
+	// back -- releasing without ever having decremented is exactly
+	// the bug ReleaseStock's initial-stock guard now rejects.
+	if err := repo.DecrementStock(context.Background(), p.ID(), 2); err != nil {
+		t.Fatalf("failed to seed a prior reservation: %v", err)
+	}
 
 	w.handleRelease(context.Background(), 0, ReleaseRequest{RequestID: "req-1", ProductID: p.ID(), Quantity: 2})
 

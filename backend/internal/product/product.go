@@ -3,11 +3,12 @@ package product
 import "errors"
 
 var (
-	ErrEmptyName         = errors.New("product: name must not be empty")
-	ErrNegativePrice     = errors.New("product: value in cents must not be negative")
-	ErrNegativeStock     = errors.New("product: stock must not be negative")
-	ErrInvalidQuantity   = errors.New("product: quantity must be positive")
-	ErrInsufficientStock = errors.New("product: insufficient stock")
+	ErrEmptyName                  = errors.New("product: name must not be empty")
+	ErrNegativePrice              = errors.New("product: value in cents must not be negative")
+	ErrNegativeStock              = errors.New("product: stock must not be negative")
+	ErrInvalidQuantity            = errors.New("product: quantity must be positive")
+	ErrInsufficientStock          = errors.New("product: insufficient stock")
+	ErrReleaseExceedsInitialStock = errors.New("product: release would exceed initial stock")
 )
 
 // Product is the aggregate root for the flash-sale catalog.
@@ -17,6 +18,12 @@ type Product struct {
 	description  string
 	valueInCents int64
 	stock        int
+
+	// initialStock is fixed at creation and never changes afterward.
+	// It's the reference point ReleaseStock checks against, so a
+	// release can never push stock past what the product actually
+	// started with.
+	initialStock int
 }
 
 func NewProduct(id, name, description string, valueInCents int64, stock int) (*Product, error) {
@@ -36,7 +43,25 @@ func NewProduct(id, name, description string, valueInCents int64, stock int) (*P
 		description:  description,
 		valueInCents: valueInCents,
 		stock:        stock,
+		initialStock: stock,
 	}, nil
+}
+
+// RehydrateProduct reconstructs a Product from already-persisted
+// data, where stock may have diverged from initialStock since
+// creation -- unlike NewProduct, which always derives initialStock
+// from stock because a freshly created product has never diverged
+// from it yet.
+func RehydrateProduct(id, name, description string, valueInCents int64, stock, initialStock int) (*Product, error) {
+	p, err := NewProduct(id, name, description, valueInCents, stock)
+	if err != nil {
+		return nil, err
+	}
+	if initialStock < 0 {
+		return nil, ErrNegativeStock
+	}
+	p.initialStock = initialStock
+	return p, nil
 }
 
 func (p *Product) ID() string { return p.id }
@@ -48,6 +73,8 @@ func (p *Product) Description() string { return p.description }
 func (p *Product) ValueInCents() int64 { return p.valueInCents }
 
 func (p *Product) Stock() int { return p.stock }
+
+func (p *Product) InitialStock() int { return p.initialStock }
 
 // DecrementStock applies a reservation of qty units.
 //
@@ -77,6 +104,9 @@ func (p *Product) DecrementStock(qty int) error {
 func (p *Product) ReleaseStock(qty int) error {
 	if qty <= 0 {
 		return ErrInvalidQuantity
+	}
+	if p.stock+qty > p.initialStock {
+		return ErrReleaseExceedsInitialStock
 	}
 	p.stock += qty
 	return nil

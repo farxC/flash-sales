@@ -38,19 +38,19 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// seedTestProduct inserts a product with the given stock directly via
-// SQL (bypassing the repository, since we're testing the repository)
-// and registers its cleanup.
-func seedTestProduct(t *testing.T, pool *pgxpool.Pool, stock int) string {
+// seedTestProduct inserts a product with the given stock and
+// initial_stock directly via SQL (bypassing the repository, since
+// we're testing the repository) and registers its cleanup.
+func seedTestProduct(t *testing.T, pool *pgxpool.Pool, stock, initialStock int) string {
 	t.Helper()
 
 	ctx := context.Background()
 	var id string
 	err := pool.QueryRow(ctx, `
-		INSERT INTO products (name, description, value_in_cents, stock)
-		VALUES ('test product', 'created by postgres_repository_test.go', 100, $1)
+		INSERT INTO products (name, description, value_in_cents, stock, initial_stock)
+		VALUES ('test product', 'created by postgres_repository_test.go', 100, $1, $2)
 		RETURNING id::text
-	`, stock).Scan(&id)
+	`, stock, initialStock).Scan(&id)
 	if err != nil {
 		t.Fatalf("failed to seed test product: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestPostgresRepository_DecrementStock_NeverOversells(t *testing.T) {
 	const initialStock = 10
 	const concurrentRequests = 50
 
-	id := seedTestProduct(t, pool, initialStock)
+	id := seedTestProduct(t, pool, initialStock, initialStock)
 
 	var succeeded, insufficientStock int64
 	var wg sync.WaitGroup
@@ -140,10 +140,12 @@ func TestPostgresRepository_ReleaseStock_NeverLosesAnUpdate(t *testing.T) {
 	pool := testPool(t)
 	repo := NewPostgresRepository(pool)
 
-	const initialStock = 0
+	const initialStock = 50
 	const concurrentReleases = 50
 
-	id := seedTestProduct(t, pool, initialStock)
+	// Start at 0 so releasing all 50 units back lands exactly on
+	// initial_stock -- the boundary itself must still be allowed.
+	id := seedTestProduct(t, pool, 0, initialStock)
 
 	var wg sync.WaitGroup
 	wg.Add(concurrentReleases)
@@ -170,5 +172,40 @@ func TestPostgresRepository_ReleaseStock_ProductNotFound(t *testing.T) {
 	err := repo.ReleaseStock(context.Background(), "00000000-0000-0000-0000-000000000000", 1)
 	if err != ErrProductNotFound {
 		t.Fatalf("got err %v, want %v", err, ErrProductNotFound)
+	}
+}
+
+func TestPostgresRepository_ReleaseStock_ExceedsInitialStock(t *testing.T) {
+	pool := testPool(t)
+	repo := NewPostgresRepository(pool)
+
+	// initial_stock=10, currently at 7 (3 reserved). Releasing 5 would
+	// put stock at 12 -- more than was ever taken out.
+	id := seedTestProduct(t, pool, 7, 10)
+
+	err := repo.ReleaseStock(context.Background(), id, 5)
+	if err != ErrReleaseExceedsInitialStock {
+		t.Fatalf("got err %v, want %v", err, ErrReleaseExceedsInitialStock)
+	}
+
+	if got := getStock(t, pool, id); got != 7 {
+		t.Errorf("stock changed to %d, want unchanged 7", got)
+	}
+}
+
+func TestPostgresRepository_ReleaseStock_UpToInitialStockSucceeds(t *testing.T) {
+	pool := testPool(t)
+	repo := NewPostgresRepository(pool)
+
+	id := seedTestProduct(t, pool, 7, 10)
+
+	// 7 + 3 = 10, landing exactly on initial_stock -- the boundary
+	// itself must be allowed.
+	if err := repo.ReleaseStock(context.Background(), id, 3); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got := getStock(t, pool, id); got != 10 {
+		t.Errorf("stock = %d, want 10", got)
 	}
 }
