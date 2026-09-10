@@ -22,10 +22,10 @@ type StockWorker struct {
 	repo      product.Repository
 	requests  <-chan Request
 	releases  <-chan ReleaseRequest
-	publisher *EventPublisher
+	publisher Publisher
 }
 
-func NewStockWorker(repo product.Repository, requests <-chan Request, releases <-chan ReleaseRequest, publisher *EventPublisher) *StockWorker {
+func NewStockWorker(repo product.Repository, requests <-chan Request, releases <-chan ReleaseRequest, publisher Publisher) *StockWorker {
 	return &StockWorker{repo: repo, requests: requests, releases: releases, publisher: publisher}
 }
 

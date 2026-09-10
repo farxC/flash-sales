@@ -13,11 +13,11 @@ import (
 
 const ReservationsConsumerGroup = "checkout-reservations-consumer"
 
-// confirmationLatency is a fake delay simulating a slow downstream
-// confirmation step (e.g. payment processing). It makes the async
-// gap between "reserved" and "approved/rejected" actually observable
-// instead of resolving near-instantly.
-const confirmationLatency = 3 * time.Second
+// defaultConfirmationLatency is a fake delay simulating a slow
+// downstream confirmation step (e.g. payment processing). It makes
+// the async gap between "reserved" and "approved/rejected" actually
+// observable instead of resolving near-instantly.
+const defaultConfirmationLatency = 3 * time.Second
 
 // orderApprovalRate is the probability that a successfully-reserved
 // order is approved during confirmation, simulating a downstream
@@ -41,19 +41,29 @@ const orderApprovalRate = 0.8
 // restart rather than silently lost.
 type EventConsumer struct {
 	reader         *kafka.Reader
-	orderPublisher *EventPublisher
+	orderPublisher Publisher
 	releases       chan<- ReleaseRequest
+
+	// confirmationLatency and randFloat default to production values
+	// (defaultConfirmationLatency, rand.Float64) and exist as fields
+	// so tests can override them -- to avoid every test taking a real
+	// 3 seconds, and to force a deterministic approve/reject outcome
+	// instead of "roughly 80%."
+	confirmationLatency time.Duration
+	randFloat           func() float64
 }
 
-func NewEventConsumer(brokerAddr string, orderPublisher *EventPublisher, releases chan<- ReleaseRequest) *EventConsumer {
+func NewEventConsumer(brokerAddr string, orderPublisher Publisher, releases chan<- ReleaseRequest) *EventConsumer {
 	return &EventConsumer{
 		reader: kafka.NewReader(kafka.ReaderConfig{
 			Brokers: []string{brokerAddr},
 			Topic:   ReservationsTopic,
 			GroupID: ReservationsConsumerGroup,
 		}),
-		orderPublisher: orderPublisher,
-		releases:       releases,
+		orderPublisher:      orderPublisher,
+		releases:            releases,
+		confirmationLatency: defaultConfirmationLatency,
+		randFloat:           rand.Float64,
 	}
 }
 
@@ -97,11 +107,11 @@ func (c *EventConsumer) process(ctx context.Context, msg kafka.Message) {
 		// confirm, nothing to release.
 		orderEvt.Status = OrderStatusRejected
 		orderEvt.Reason = evt.Reason
-	} else if !sleep(ctx, confirmationLatency) {
+	} else if !sleep(ctx, c.confirmationLatency) {
 		// Context was canceled (shutdown) while "confirming" -- drop
 		// this event rather than publish with a canceled context.
 		return
-	} else if rand.Float64() < orderApprovalRate {
+	} else if c.randFloat() < orderApprovalRate {
 		orderEvt.Status = OrderStatusApproved
 	} else {
 		orderEvt.Status = OrderStatusRejected

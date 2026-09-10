@@ -12,6 +12,14 @@ const (
 	OrderStatusTopic  = "order.status"
 )
 
+// Publisher publishes a pre-encoded message under a key. StockWorker
+// and EventConsumer depend on this interface rather than *EventPublisher
+// directly, so tests can inject a fake instead of needing a live Kafka
+// connection.
+type Publisher interface {
+	Publish(ctx context.Context, key string, value []byte) error
+}
+
 // EventPublisher publishes pre-encoded messages to a single Kafka
 // topic. It's topic-agnostic by design so it can be reused for both
 // checkout.reservations and order.status.
