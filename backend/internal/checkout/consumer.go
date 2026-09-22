@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+
+	"flash-sales/backend/internal/order"
 )
 
 const ReservationsConsumerGroup = "checkout-reservations-consumer"
@@ -42,6 +44,7 @@ const orderApprovalRate = 0.8
 type EventConsumer struct {
 	reader         *kafka.Reader
 	orderPublisher Publisher
+	orderRepo      order.Repository
 	releases       chan<- ReleaseRequest
 
 	// confirmationLatency and randFloat default to production values
@@ -53,7 +56,7 @@ type EventConsumer struct {
 	randFloat           func() float64
 }
 
-func NewEventConsumer(brokerAddr string, orderPublisher Publisher, releases chan<- ReleaseRequest) *EventConsumer {
+func NewEventConsumer(brokerAddr string, orderPublisher Publisher, orderRepo order.Repository, releases chan<- ReleaseRequest) *EventConsumer {
 	return &EventConsumer{
 		reader: kafka.NewReader(kafka.ReaderConfig{
 			Brokers: []string{brokerAddr},
@@ -61,6 +64,7 @@ func NewEventConsumer(brokerAddr string, orderPublisher Publisher, releases chan
 			GroupID: ReservationsConsumerGroup,
 		}),
 		orderPublisher:      orderPublisher,
+		orderRepo:           orderRepo,
 		releases:            releases,
 		confirmationLatency: defaultConfirmationLatency,
 		randFloat:           rand.Float64,
@@ -117,6 +121,18 @@ func (c *EventConsumer) process(ctx context.Context, msg kafka.Message) {
 		orderEvt.Status = OrderStatusRejected
 		orderEvt.Reason = "order rejected during confirmation"
 		c.releases <- ReleaseRequest{RequestID: evt.RequestID, ProductID: evt.ProductID, Quantity: evt.Quantity}
+	}
+
+	// Best-effort, same as StockWorker's order-status update: logged
+	// on failure, never blocks the OrderStatusEvent publish below.
+	var orderErr error
+	if orderEvt.Status == OrderStatusApproved {
+		orderErr = c.orderRepo.MarkApproved(ctx, evt.RequestID)
+	} else {
+		orderErr = c.orderRepo.MarkRejected(ctx, evt.RequestID, orderEvt.Reason)
+	}
+	if orderErr != nil {
+		log.Printf("checkout: failed to update order status for request %s: %v", evt.RequestID, orderErr)
 	}
 
 	body, err := json.Marshal(orderEvt)

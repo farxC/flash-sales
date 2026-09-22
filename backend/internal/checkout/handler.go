@@ -6,16 +6,18 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"flash-sales/backend/internal/order"
 	"flash-sales/backend/internal/product"
 )
 
 type Handler struct {
-	repo     product.Repository
-	requests chan<- Request
+	repo      product.Repository
+	orderRepo order.Repository
+	requests  chan<- Request
 }
 
-func NewHandler(repo product.Repository, requests chan<- Request) *Handler {
-	return &Handler{repo: repo, requests: requests}
+func NewHandler(repo product.Repository, orderRepo order.Repository, requests chan<- Request) *Handler {
+	return &Handler{repo: repo, orderRepo: orderRepo, requests: requests}
 }
 
 type checkoutBody struct {
@@ -39,7 +41,8 @@ func (h *Handler) Checkout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.repo.FindByID(r.Context(), body.ProductID); err != nil {
+	prod, err := h.repo.FindByID(r.Context(), body.ProductID)
+	if err != nil {
 		http.Error(w, "product not found", http.StatusNotFound)
 		return
 	}
@@ -47,6 +50,26 @@ func (h *Handler) Checkout(w http.ResponseWriter, r *http.Request) {
 	requestID, err := newRequestID()
 	if err != nil {
 		http.Error(w, "failed to create request", http.StatusInternalServerError)
+		return
+	}
+
+	// The order is created synchronously, before enqueueing, and
+	// fails closed: nothing else has happened yet at this point, so
+	// it's cheap to refuse the whole checkout attempt if this fails.
+	// StockWorker/EventConsumer, by contrast, treat their later
+	// order-status updates as best-effort (see worker.go/consumer.go).
+	item, err := order.NewItem(prod.ID(), body.Quantity, prod.ValueInCents())
+	if err != nil {
+		http.Error(w, "failed to build order", http.StatusInternalServerError)
+		return
+	}
+	ord, err := order.NewOrder(requestID, order.GuestConsumerID, []order.Item{item})
+	if err != nil {
+		http.Error(w, "failed to build order", http.StatusInternalServerError)
+		return
+	}
+	if err := h.orderRepo.Create(r.Context(), ord); err != nil {
+		http.Error(w, "failed to create order", http.StatusInternalServerError)
 		return
 	}
 

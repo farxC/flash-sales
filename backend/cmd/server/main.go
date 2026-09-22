@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"flash-sales/backend/internal/checkout"
+	"flash-sales/backend/internal/order"
 	"flash-sales/backend/internal/product"
 )
 
@@ -50,6 +51,7 @@ func main() {
 
 	productRepo := product.NewPostgresRepository(pgPool)
 	productHandler := product.NewHandler(productRepo)
+	orderRepo := order.NewPostgresRepository(pgPool)
 
 	kafkaBroker := os.Getenv("KAFKA_BROKER")
 	if kafkaBroker == "" {
@@ -65,14 +67,14 @@ func main() {
 	requests := make(chan checkout.Request, checkoutQueueSize)
 	releases := make(chan checkout.ReleaseRequest, checkoutQueueSize)
 
-	consumer := checkout.NewEventConsumer(kafkaBroker, orderPublisher, releases)
+	consumer := checkout.NewEventConsumer(kafkaBroker, orderPublisher, orderRepo, releases)
 	defer consumer.Close()
 
 	broadcaster := checkout.NewOrderStatusBroadcaster(kafkaBroker)
 	defer broadcaster.Close()
 
-	stockWorker := checkout.NewStockWorker(productRepo, requests, releases, reservationPublisher)
-	checkoutHandler := checkout.NewHandler(productRepo, requests)
+	stockWorker := checkout.NewStockWorker(productRepo, orderRepo, requests, releases, reservationPublisher)
+	checkoutHandler := checkout.NewHandler(productRepo, orderRepo, requests)
 
 	stockWorkerPoolSize := envInt("STOCK_WORKER_POOL_SIZE", 4)
 	log.Printf("starting %d stock workers", stockWorkerPoolSize)

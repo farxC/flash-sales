@@ -44,6 +44,11 @@ CREATE TRIGGER products_set_updated_at
 CREATE TABLE orders (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   consumer_id UUID NOT NULL REFERENCES consumers(id),
+  -- Correlation key threaded through the whole checkout pipeline
+  -- (checkout.Request, ReservationEvent, OrderStatusEvent all carry
+  -- this same id) -- StockWorker and EventConsumer update this row
+  -- via WHERE request_id = $1, never by primary key.
+  request_id TEXT NOT NULL UNIQUE,
   total_value_in_cents BIGINT NOT NULL DEFAULT 0 CHECK (total_value_in_cents >= 0),
   status TEXT NOT NULL CHECK (status IN ('pending', 'reserved', 'approved', 'rejected')),
   paid_at TIMESTAMPTZ,
@@ -83,4 +88,23 @@ VALUES (
   1999900,
   100,
   100
+);
+
+-- Deliberately a single, fixed "guest" consumer -- buyer identity
+-- and auth are out of scope for this project (the focus is
+-- event-driven architecture, not e-commerce). Every order uses this
+-- same consumer id, referenced from Go as order.GuestConsumerID.
+--
+-- CAUTION: like the products seed above, this only runs on a FRESH
+-- postgres_data volume (see the file-level comment at the top). If
+-- you already have a running local Postgres from before this
+-- change, `docker compose down -v` (or manually run this INSERT and
+-- the orders.request_id column addition) before the guest consumer
+-- or request_id will exist.
+INSERT INTO consumers (id, name, address, tax_id)
+VALUES (
+  '00000000-0000-0000-0000-000000000001',
+  'Guest',
+  'N/A',
+  'N/A'
 );
