@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"flash-sales/backend/internal/order"
 	"flash-sales/backend/internal/product"
 )
 
@@ -54,6 +55,27 @@ func newWorkerTestProduct(t *testing.T, stock int) (*product.Product, *product.I
 	return p, product.NewInMemoryRepository([]*product.Product{p})
 }
 
+// seedTestOrder creates a pending order for requestID/productID via
+// orderRepo.Create, standing in for the order checkout.Handler would
+// normally have created before StockWorker/EventConsumer ever see the
+// request -- these tests call handleReservation/process directly,
+// bypassing the Handler.
+func seedTestOrder(t *testing.T, orderRepo order.Repository, requestID, productID string, quantity int, valueInCents int64) {
+	t.Helper()
+
+	item, err := order.NewItem(productID, quantity, valueInCents)
+	if err != nil {
+		t.Fatalf("failed to build order item: %v", err)
+	}
+	ord, err := order.NewOrder(requestID, order.GuestConsumerID, []order.Item{item})
+	if err != nil {
+		t.Fatalf("failed to build order: %v", err)
+	}
+	if err := orderRepo.Create(context.Background(), ord); err != nil {
+		t.Fatalf("failed to seed order: %v", err)
+	}
+}
+
 func decodeReservationEvent(t *testing.T, body []byte) ReservationEvent {
 	t.Helper()
 	var evt ReservationEvent
@@ -66,7 +88,9 @@ func decodeReservationEvent(t *testing.T, body []byte) ReservationEvent {
 func TestStockWorker_HandleReservation_Success(t *testing.T) {
 	p, repo := newWorkerTestProduct(t, 5)
 	pub := &fakePublisher{}
-	w := NewStockWorker(repo, nil, nil, pub)
+	orderRepo := order.NewInMemoryRepository()
+	seedTestOrder(t, orderRepo, "req-1", p.ID(), 2, p.ValueInCents())
+	w := NewStockWorker(repo, orderRepo, nil, nil, pub)
 
 	w.handleReservation(context.Background(), 0, Request{ID: "req-1", ProductID: p.ID(), Quantity: 2})
 
@@ -85,12 +109,22 @@ func TestStockWorker_HandleReservation_Success(t *testing.T) {
 	if updated.Stock() != 3 {
 		t.Errorf("stock = %d, want 3", updated.Stock())
 	}
+
+	ord, err := orderRepo.FindByRequestID(context.Background(), "req-1")
+	if err != nil {
+		t.Fatalf("failed to find order: %v", err)
+	}
+	if ord.Status() != order.StatusReserved {
+		t.Errorf("order status = %q, want %q", ord.Status(), order.StatusReserved)
+	}
 }
 
 func TestStockWorker_HandleReservation_InsufficientStock(t *testing.T) {
 	p, repo := newWorkerTestProduct(t, 1)
 	pub := &fakePublisher{}
-	w := NewStockWorker(repo, nil, nil, pub)
+	orderRepo := order.NewInMemoryRepository()
+	seedTestOrder(t, orderRepo, "req-1", p.ID(), 5, p.ValueInCents())
+	w := NewStockWorker(repo, orderRepo, nil, nil, pub)
 
 	w.handleReservation(context.Background(), 0, Request{ID: "req-1", ProductID: p.ID(), Quantity: 5})
 
@@ -106,12 +140,22 @@ func TestStockWorker_HandleReservation_InsufficientStock(t *testing.T) {
 	if updated.Stock() != 1 {
 		t.Errorf("stock = %d, want unchanged 1", updated.Stock())
 	}
+
+	ord, err := orderRepo.FindByRequestID(context.Background(), "req-1")
+	if err != nil {
+		t.Fatalf("failed to find order: %v", err)
+	}
+	if ord.Status() != order.StatusRejected {
+		t.Errorf("order status = %q, want %q", ord.Status(), order.StatusRejected)
+	}
 }
 
 func TestStockWorker_HandleReservation_ProductNotFound(t *testing.T) {
 	_, repo := newWorkerTestProduct(t, 5)
 	pub := &fakePublisher{}
-	w := NewStockWorker(repo, nil, nil, pub)
+	orderRepo := order.NewInMemoryRepository()
+	seedTestOrder(t, orderRepo, "req-1", "does-not-exist", 1, 1000)
+	w := NewStockWorker(repo, orderRepo, nil, nil, pub)
 
 	w.handleReservation(context.Background(), 0, Request{ID: "req-1", ProductID: "does-not-exist", Quantity: 1})
 
@@ -124,7 +168,8 @@ func TestStockWorker_HandleReservation_ProductNotFound(t *testing.T) {
 func TestStockWorker_HandleRelease_Success(t *testing.T) {
 	p, repo := newWorkerTestProduct(t, 5)
 	pub := &fakePublisher{}
-	w := NewStockWorker(repo, nil, nil, pub)
+	orderRepo := order.NewInMemoryRepository()
+	w := NewStockWorker(repo, orderRepo, nil, nil, pub)
 
 	// Simulate a prior reservation of 2 units before releasing them
 	// back -- releasing without ever having decremented is exactly

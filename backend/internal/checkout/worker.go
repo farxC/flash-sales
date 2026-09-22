@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 
+	"flash-sales/backend/internal/order"
 	"flash-sales/backend/internal/product"
 )
 
@@ -20,13 +21,14 @@ import (
 // downstream -- on a separate channel.
 type StockWorker struct {
 	repo      product.Repository
+	orderRepo order.Repository
 	requests  <-chan Request
 	releases  <-chan ReleaseRequest
 	publisher Publisher
 }
 
-func NewStockWorker(repo product.Repository, requests <-chan Request, releases <-chan ReleaseRequest, publisher Publisher) *StockWorker {
-	return &StockWorker{repo: repo, requests: requests, releases: releases, publisher: publisher}
+func NewStockWorker(repo product.Repository, orderRepo order.Repository, requests <-chan Request, releases <-chan ReleaseRequest, publisher Publisher) *StockWorker {
+	return &StockWorker{repo: repo, orderRepo: orderRepo, requests: requests, releases: releases, publisher: publisher}
 }
 
 func (w *StockWorker) Run(ctx context.Context, workerID int) {
@@ -56,6 +58,21 @@ func (w *StockWorker) handleReservation(ctx context.Context, workerID int, req R
 		evt.Reason = err.Error()
 	} else {
 		evt.Status = StatusReserved
+	}
+
+	// Best-effort: an order-status write failure is logged but never
+	// blocks the ReservationEvent publish below, the same way a
+	// Publish failure itself is only logged. This lets the order row
+	// and the Kafka event drift apart on failure -- exactly the gap a
+	// future transactional outbox (roadmap item 8) closes.
+	var orderErr error
+	if evt.Status == StatusReserved {
+		orderErr = w.orderRepo.MarkReserved(ctx, req.ID)
+	} else {
+		orderErr = w.orderRepo.MarkRejected(ctx, req.ID, evt.Reason)
+	}
+	if orderErr != nil {
+		log.Printf("checkout: worker %d failed to update order status for request %s: %v", workerID, req.ID, orderErr)
 	}
 
 	body, err := json.Marshal(evt)

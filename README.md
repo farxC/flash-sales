@@ -39,11 +39,11 @@ while `initial_stock` stays frozen. The correct real-world fix is a
 (incremented by `DecrementStock`, decremented by `ReleaseStock`, so
 the check becomes "can't release more than is currently reserved" —
 survives any number of restocks), or the `orders`/`order_items`
-ledger already in `schema.sql` but not yet wired into the checkout
-flow, which would track the exact quantity tied to each specific
-reservation rather than a single product-wide number. `initial_stock`
-was a deliberate simplification for this pass, not a design worth
-carrying into anything beyond a study project.
+ledger (now wired into the checkout flow, see below), which would
+track the exact quantity tied to each specific reservation rather
+than a single product-wide number. `initial_stock` was a deliberate
+simplification for this pass, not a design worth carrying into
+anything beyond a study project.
 
 ### Checkout flow (fire-and-forget, Kafka-backed)
 
@@ -89,6 +89,46 @@ A few things this design deliberately demonstrates:
   every event, rather than each message going to exactly one
   consumer.
 
+### Order persistence
+
+`orders`/`order_items` (`backend/internal/order`) are a DDD aggregate
+mirroring `Product`'s shape: a validating constructor, private
+fields, and `Order.status` is a state machine the aggregate enforces
+itself (`pending → reserved → approved`, `pending → rejected`
+immediately for out-of-stock, `reserved → rejected` for a
+confirmation-stage rejection). `approved`/`rejected` are terminal —
+every transition method refuses to run again once an order reaches
+one, which is a deliberate down payment on future idempotent-consumer
+work (a redelivered Kafka message that tries to re-apply an
+already-applied transition gets refused by the domain model itself,
+not just by careful consumer code).
+
+No new Kafka consumer was added to write these rows. `Handler`
+creates the order (`pending`) synchronously before enqueueing; Worker
+A marks it `reserved`/`rejected` right where it already publishes
+`ReservationEvent`; Worker B marks it `approved`/`rejected` right
+where it already publishes `OrderStatusEvent`. Rows are correlated by
+`orders.request_id`, not primary key — the same `RequestID` already
+threaded through `Request`/`ReservationEvent`/`OrderStatusEvent`.
+Extending the existing publishers instead of adding a third consumer
+of the same topics is deliberate: a future transactional outbox needs
+the Postgres write and the Kafka publish to happen in the same
+component, and this keeps that composable later without a rewrite.
+
+Two simplifications worth being explicit about:
+- **Buyer identity is out of scope.** There's no auth. Every order is
+  placed under one fixed, seeded "guest" consumer
+  (`order.GuestConsumerID`) — the focus here is event-driven
+  architecture, not e-commerce.
+- **Order-status write failures are best-effort.** If `StockWorker`
+  or `EventConsumer` fail to update the order row, they log it but
+  still publish the Kafka event regardless — consistent with how a
+  `Publish` failure a few lines later is already handled, and exactly
+  the gap a future transactional outbox pattern would close.
+  `Handler`'s initial order creation, by contrast, fails closed
+  (`500`, nothing enqueued) since nothing else has happened yet at
+  that point.
+
 ### Endpoints
 
 | Endpoint | Method | Notes |
@@ -99,6 +139,12 @@ A few things this design deliberately demonstrates:
 | `/events` | GET | Server-Sent Events stream of `OrderStatusEvent`s |
 
 ## Running locally
+
+`schema.sql` only runs on a fresh Postgres volume (see the comment at
+the top of that file) — if you already have a local `postgres_data`
+volume from before order persistence was added, run
+`docker compose down -v` first so the `orders.request_id` column and
+the seeded guest consumer actually get created.
 
 Kafka needs its topics created once before the backend can publish
 to them (auto-creation is intentionally off, so partition counts are
@@ -163,7 +209,7 @@ Original plan vs. what actually got built, and what's still ahead:
    no longer resets stock, and a burst of concurrent requests never
    oversells. The `orders`/`order_items`/`consumers` tables exist in
    `backend/db/schema.sql` but aren't wired into the checkout flow
-   yet -- persisting an actual order per checkout is still open.
+   yet -- see step 7 below.
 6. ~~Coordinate stock across multiple backend instances (Redis)~~ --
    this premise turned out not to survive contact with what got
    built: Postgres's row-level locking doesn't care whether concurrent
@@ -175,20 +221,79 @@ Original plan vs. what actually got built, and what's still ahead:
    than a Postgres row lock at scale) -- a genuinely different
    motivation, revisit only if/when that specific bottleneck actually
    shows up, not as a default "next step."
-7. **Cache invalidation under concurrent writes (Redis)** — a
-   deliberately different motivation than step 6: not "make reads
-   faster" but "what happens when a cached product's stock goes stale
-   the instant a write happens underneath it." Framed this way it
-   stays a concurrency lesson rather than a pure performance one. Not
-   started.
-8. **Read/write split (CQRS-style)** — well-motivated here (catalog
-   reads vastly outnumber checkout writes during a real flash sale),
-   but deliberately sequenced *after* step 5 so it doesn't mix two
-   new kinds of complexity (persistence, then replication/eventual
-   consistency) into the same pass. Not started.
-9. **A real queueing / waiting-room UI** for traffic spikes — Worker
-   B's fake latency already produces a visible backlog; an actual
-   waiting-room experience on the frontend is still open.
+
+**Revisited 2026-09-09** — rather than reaching for new features
+abstractly, we traced concrete reliability gaps that already exist in
+the running async pipeline. These four are sequenced as one arc
+(each depends on the one before it) and are now the focus, ahead of
+the previously-planned Redis/CQRS work:
+
+7. **Wire real orders into the checkout flow** — done. `Handler`
+   creates a `pending` order (+ one `order_items` row) synchronously
+   before enqueueing; `StockWorker` marks it `reserved`/`rejected`
+   right where it already publishes `ReservationEvent`; `EventConsumer`
+   marks it `approved`/`rejected` right where it already publishes
+   `OrderStatusEvent` -- correlated by `orders.request_id`, not
+   primary key. Deliberately no new Kafka consumer: extending the two
+   components that already publish events, rather than adding a third
+   consumer of the same topics, is what keeps step 8 below composable
+   without a rewrite (the DB write and the Kafka publish now already
+   live in the same component). `Order.status` is a state machine the
+   aggregate enforces itself (see the "Order persistence" section
+   above) -- terminal-state transitions are refused outright, a
+   down payment on step 9. See `backend/internal/order`.
+8. **Transactional outbox for the stock-decrement + event-publish
+   dual-write** — `StockWorker.handleReservation` decrements stock in
+   Postgres and publishes to Kafka as two independent calls
+   (`worker.go:54-68`); a crash between them drops the event with
+   stock already decremented and nothing downstream ever notified. A
+   plain SQL transaction can't fix this -- it only spans Postgres, not
+   Kafka -- so the fix is to shrink the atomic unit down to Postgres
+   alone: write an `outbox` row in the same transaction as the
+   order-status write step 7 already added to `StockWorker`, then a
+   separate relay (poller or CDC) does the actual Kafka publish
+   afterward. Not started.
+9. **Idempotent consumers (dedup on redelivery)** — neither
+   `EventConsumer.process` nor `StockWorker.handleRelease` guards
+   against reprocessing the same message twice. Kafka's at-least-once
+   guarantee only promises redelivery after a crash between
+   `FetchMessage` and `CommitMessages` -- it says nothing about a
+   handler's side effects being safe to repeat, and today they aren't:
+   a crash there can double-release stock or emit a duplicate
+   `OrderStatusEvent` on restart. This is what makes step 8's relay
+   safe to retry -- dedup on the outbox row's id (e.g. a unique
+   constraint on a `processed_events` table checked before applying a
+   release or status change). Not started.
+10. **Dead-letter / bounded retry for poison messages** — worth
+    calling out precisely: `EventConsumer.Run` calls
+    `CommitMessages` unconditionally after `process()` returns
+    (`consumer.go:82-85`), regardless of whether decoding or
+    publishing inside it failed. So today a bad message isn't
+    "retried forever" -- it's silently dropped, offset and all, the
+    one time it's seen. Real retry/DLQ behavior depends on step 9's
+    idempotency work first, since retrying implies redelivery. Not
+    started.
+11. **Increase Kafka partitions per topic** — both topics are created
+    with `--partitions 1`, so consumer groups today can never exercise
+    the thing they exist for (parallel consumption across partitions,
+    rebalancing). Revisit once ordering requirements are explicit
+    (e.g. must all events for one product stay strictly ordered?).
+    Not started.
+12. **Cache invalidation under concurrent writes (Redis)** — a
+    deliberately different motivation than step 6: not "make reads
+    faster" but "what happens when a cached product's stock goes
+    stale the instant a write happens underneath it." Framed this way
+    it stays a concurrency lesson rather than a pure performance one.
+    Not started.
+13. **Read/write split (CQRS-style)** — well-motivated here (catalog
+    reads vastly outnumber checkout writes during a real flash sale).
+    Now clearly sequenced *after* steps 7-9: there's a real order
+    lifecycle and reliable event delivery to project into a read
+    model, rather than mixing persistence and replication concerns
+    into the same pass. Not started.
+14. **A real queueing / waiting-room UI** for traffic spikes — Worker
+    B's fake latency already produces a visible backlog; an actual
+    waiting-room experience on the frontend is still open.
 
 See `docs/superpowers/specs/` for the design spec behind the initial
 pass.

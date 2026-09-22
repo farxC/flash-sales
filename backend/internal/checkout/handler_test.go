@@ -1,12 +1,15 @@
 package checkout
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"flash-sales/backend/internal/order"
 	"flash-sales/backend/internal/product"
 )
 
@@ -32,7 +35,7 @@ func doCheckout(t *testing.T, handler *Handler, body string) *httptest.ResponseR
 func TestCheckout_InvalidBody(t *testing.T) {
 	_, repo := seedProduct(t)
 	requests := make(chan Request, 1)
-	handler := NewHandler(repo, requests)
+	handler := NewHandler(repo, order.NewInMemoryRepository(), requests)
 
 	rec := doCheckout(t, handler, `not json`)
 
@@ -44,7 +47,7 @@ func TestCheckout_InvalidBody(t *testing.T) {
 func TestCheckout_InvalidQuantity(t *testing.T) {
 	p, repo := seedProduct(t)
 	requests := make(chan Request, 1)
-	handler := NewHandler(repo, requests)
+	handler := NewHandler(repo, order.NewInMemoryRepository(), requests)
 
 	rec := doCheckout(t, handler, `{"productId":"`+p.ID()+`","quantity":0}`)
 
@@ -56,7 +59,7 @@ func TestCheckout_InvalidQuantity(t *testing.T) {
 func TestCheckout_ProductNotFound(t *testing.T) {
 	_, repo := seedProduct(t)
 	requests := make(chan Request, 1)
-	handler := NewHandler(repo, requests)
+	handler := NewHandler(repo, order.NewInMemoryRepository(), requests)
 
 	rec := doCheckout(t, handler, `{"productId":"does-not-exist","quantity":1}`)
 
@@ -68,7 +71,7 @@ func TestCheckout_ProductNotFound(t *testing.T) {
 func TestCheckout_Success(t *testing.T) {
 	p, repo := seedProduct(t)
 	requests := make(chan Request, 1)
-	handler := NewHandler(repo, requests)
+	handler := NewHandler(repo, order.NewInMemoryRepository(), requests)
 
 	rec := doCheckout(t, handler, `{"productId":"`+p.ID()+`","quantity":2}`)
 
@@ -100,11 +103,76 @@ func TestCheckout_Success(t *testing.T) {
 	}
 }
 
+func TestCheckout_Success_CreatesOrder(t *testing.T) {
+	p, repo := seedProduct(t)
+	requests := make(chan Request, 1)
+	orderRepo := order.NewInMemoryRepository()
+	handler := NewHandler(repo, orderRepo, requests)
+
+	rec := doCheckout(t, handler, `{"productId":"`+p.ID()+`","quantity":2}`)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+
+	var resp checkoutResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response body: %v", err)
+	}
+
+	ord, err := orderRepo.FindByRequestID(context.Background(), resp.RequestID)
+	if err != nil {
+		t.Fatalf("expected order to have been created: %v", err)
+	}
+	if ord.Status() != order.StatusPending {
+		t.Errorf("status = %q, want %q", ord.Status(), order.StatusPending)
+	}
+	if ord.ConsumerID() != order.GuestConsumerID {
+		t.Errorf("consumerID = %q, want %q", ord.ConsumerID(), order.GuestConsumerID)
+	}
+	if len(ord.Items()) != 1 || ord.Items()[0].ProductID() != p.ID() || ord.Items()[0].Quantity() != 2 {
+		t.Errorf("unexpected items: %+v", ord.Items())
+	}
+	if want := p.ValueInCents() * 2; ord.TotalValueInCents() != want {
+		t.Errorf("total = %d, want %d", ord.TotalValueInCents(), want)
+	}
+}
+
+// createFailingOrderRepo is a fake order.Repository whose Create
+// always errors, used to verify Checkout fails closed on
+// order-creation failure -- unlike StockWorker/EventConsumer's later
+// best-effort order-status updates, this is the one point where
+// nothing else has happened yet, so refusing the whole attempt is
+// cheap and correct.
+type createFailingOrderRepo struct{ order.Repository }
+
+func (createFailingOrderRepo) Create(ctx context.Context, o *order.Order) error {
+	return errors.New("boom")
+}
+
+func TestCheckout_OrderRepoFailure_Returns500AndDoesNotEnqueue(t *testing.T) {
+	p, repo := seedProduct(t)
+	requests := make(chan Request, 1)
+	handler := NewHandler(repo, createFailingOrderRepo{}, requests)
+
+	rec := doCheckout(t, handler, `{"productId":"`+p.ID()+`","quantity":1}`)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+
+	select {
+	case req := <-requests:
+		t.Fatalf("expected nothing enqueued, got %+v", req)
+	default:
+	}
+}
+
 func TestCheckout_RejectsWhenQueueFull(t *testing.T) {
 	p, repo := seedProduct(t)
 	requests := make(chan Request, 1)
 	requests <- Request{ID: "already-queued"} // fill the only slot
-	handler := NewHandler(repo, requests)
+	handler := NewHandler(repo, order.NewInMemoryRepository(), requests)
 
 	rec := doCheckout(t, handler, `{"productId":"`+p.ID()+`","quantity":1}`)
 
